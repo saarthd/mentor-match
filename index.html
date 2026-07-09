@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Mentor Match</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header">
+      <nav class="nav" aria-label="Main navigation">
+        <a class="brand" href="index.html" aria-label="Mentor Match home">
+          <span class="brand-mark" aria-hidden="true">MM</span>
+          <span>Mentor Match</span>
+        </a>
+        <span class="nav-note">Research mentor finder</span>
+      </nav>
+    </header>
+
+    <main>
+      <section class="intro" aria-labelledby="page-title">
+        <div class="intro-copy">
+          <p class="eyebrow">Research mentor search</p>
+          <h1 id="page-title">Find mentors whose work matches your project.</h1>
+          <p>
+            Paste a short description of your research idea, then compare it with
+            mentor fields, keywords, and relevant paper titles.
+          </p>
+        </div>
+      </section>
+
+      <section class="matcher" aria-label="Mentor matching form">
+        <div class="input-panel">
+          <div class="field-row">
+            <label for="student-input">Project or research interests</label>
+            <span id="word-count" class="word-count">0 words</span>
+          </div>
+
+          <textarea
+            id="student-input"
+            rows="10"
+            placeholder="Example: I am interested in building a lightweight robotic inspection system for offshore wind turbines. My project combines machine learning, computer vision, autonomous navigation, and sensor fusion to detect corrosion, surface cracks, and power electronics failures. I want to explore safe field robotics, embedded perception, reliability engineering, and renewable energy systems. I am also curious about publishing a small dataset and comparing classical feature methods with deep learning models for maintenance planning."
+          ></textarea>
+
+          <div class="control-row">
+            <div class="select-wrap">
+              <label for="field-filter">Field filter</label>
+              <select id="field-filter">
+                <option value="all">All fields</option>
+              </select>
+            </div>
+
+            <button id="find-button" class="primary-button" type="button">
+              Find Mentors
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <section class="results-region" aria-labelledby="results-title">
+        <div class="results-heading">
+          <div>
+            <p class="eyebrow">Top matches</p>
+            <h2 id="results-title">Mentor results</h2>
+          </div>
+          <p id="result-summary" class="result-summary">Enter a paragraph to begin.</p>
+        </div>
+
+        <div id="results" class="results" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>Built for student research exploration and mentor discovery.</p>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
