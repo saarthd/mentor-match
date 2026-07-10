@@ -217,7 +217,8 @@ select {
 }
 
 .primary-button,
-.copy-button {
+.copy-button,
+.secondary-button {
   border: 0;
   border-radius: 8px;
   cursor: pointer;
@@ -234,7 +235,8 @@ select {
 }
 
 .primary-button:hover,
-.copy-button:hover {
+.copy-button:hover,
+.secondary-button:hover {
   transform: translateY(-1px);
 }
 
@@ -395,6 +397,56 @@ select {
 
 .copy-button.copied {
   background: var(--success);
+}
+
+.secondary-button {
+  padding: 10px 13px;
+  border: 1px solid var(--border);
+  background: #ffffff;
+  color: var(--text);
+  font-size: 0.92rem;
+}
+
+.copy-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(22, 32, 51, 0.48);
+}
+
+.copy-dialog.hidden {
+  display: none;
+}
+
+.copy-dialog-panel {
+  width: min(680px, 100%);
+  max-height: min(780px, calc(100vh - 40px));
+  display: grid;
+  gap: 14px;
+  overflow: auto;
+  padding: 22px;
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.copy-dialog-panel h2 {
+  margin-bottom: 0;
+  font-size: 1.35rem;
+}
+
+.copy-dialog-panel textarea {
+  min-height: 260px;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .site-footer {
