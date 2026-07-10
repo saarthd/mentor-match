@@ -39,6 +39,7 @@ a {
 
 button,
 textarea,
+input,
 select {
   font: inherit;
 }
@@ -174,10 +175,9 @@ label {
   color: var(--muted);
 }
 
-textarea {
+textarea,
+.copy-dialog-panel input {
   width: 100%;
-  min-height: 230px;
-  resize: vertical;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #fbfcff;
@@ -187,7 +187,17 @@ textarea {
   transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
 }
 
+.copy-dialog-panel input {
+  min-height: 46px;
+}
+
+textarea {
+  min-height: 230px;
+  resize: vertical;
+}
+
 textarea:focus,
+.copy-dialog-panel input:focus,
 select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.13);

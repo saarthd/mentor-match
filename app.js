@@ -4,6 +4,7 @@ const DATA_INDEX_URL = "experts.json";
 const MAX_RESULTS = 12;
 const DEFAULT_SHARDS_TO_LOAD = 3;
 const MAX_SHARDS_TO_SEARCH = 8;
+const OUTREACH_SUBJECT = "Student interested in your research";
 
 const TERM_WEIGHTS = {
   field: 3.2,
@@ -822,10 +823,17 @@ function createListSection(label, items, listClass) {
 
 async function copyOutreachDraft(button, expert, studentText) {
   const draft = normalizeClipboardText(buildOutreachDraft(expert, studentText));
-  const copied = await copyPlainText(draft);
+
+  if (isIOSDevice()) {
+    const copied = showManualCopyDialog(draft);
+    showCopiedState(button, copied ? "Message copied" : "Draft opened");
+    return;
+  }
+
+  const copied = await copyPlainText(draft.body);
 
   if (copied) {
-    showCopiedState(button, "Copied");
+    showCopiedState(button, "Message copied");
     return;
   }
 
@@ -841,9 +849,7 @@ function buildOutreachDraft(expert, studentText) {
     ? `Your work on ${keywordList} stood out to me${paper ? `, especially "${paper}."` : "."}`
     : `Your research profile stood out to me${paper ? `, especially "${paper}."` : "."}`;
 
-  return `Subject: Student interested in your research
-
-Dear Dr. ${lastName},
+  const body = `Dear Dr. ${lastName},
 
 My name is [Your Name], and I am exploring potential mentors for a student research project. My current idea is:
 
@@ -853,10 +859,15 @@ ${researchLine} If you are open to it, I would be grateful for a short conversat
 
 Thank you for your time,
 [Your Name]`;
+
+  return {
+    subject: OUTREACH_SUBJECT,
+    body
+  };
 }
 
 async function copyPlainText(text) {
-  const plainText = normalizeClipboardText(text);
+  const plainText = cleanPlainText(text);
 
   if (navigator.clipboard && navigator.clipboard.writeText) {
     try {
@@ -900,11 +911,22 @@ function fallbackCopyText(text) {
   return copied;
 }
 
-function normalizeClipboardText(text) {
+function normalizeClipboardText(draft) {
+  return {
+    subject: cleanPlainText(draft.subject || OUTREACH_SUBJECT),
+    body: cleanPlainText(draft.body || draft)
+  };
+}
+
+function cleanPlainText(text) {
   return String(text)
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n")
-    .replace(/\u00a0/g, " ");
+    .replace(/\u00a0/g, " ")
+    .replace(/%([0-9a-fA-F]{2})/g, (match, hex) => {
+      const code = Number.parseInt(hex, 16);
+      return code >= 32 && code <= 126 ? String.fromCharCode(code) : match;
+    });
 }
 
 function isIOSDevice() {
@@ -915,14 +937,17 @@ function isIOSDevice() {
     || (platform === "MacIntel" && maxTouchPoints > 1);
 }
 
-function showManualCopyDialog(text) {
+function showManualCopyDialog(draft) {
   const dialog = getCopyDialog();
-  const textarea = dialog.querySelector("textarea");
-  textarea.value = text;
+  const subjectInput = dialog.querySelector("#copy-dialog-subject");
+  const bodyTextarea = dialog.querySelector("#copy-dialog-body");
+  subjectInput.value = draft.subject;
+  bodyTextarea.value = draft.body;
   dialog.classList.remove("hidden");
-  textarea.focus();
-  textarea.select();
-  textarea.setSelectionRange(0, textarea.value.length);
+  bodyTextarea.focus();
+  bodyTextarea.select();
+  bodyTextarea.setSelectionRange(0, bodyTextarea.value.length);
+  return copySelectedControlText(bodyTextarea);
 }
 
 function getCopyDialog() {
@@ -940,9 +965,25 @@ function getCopyDialog() {
   const panel = el("div", "copy-dialog-panel");
   panel.append(el("h2", "", "Copy email draft"));
   panel.querySelector("h2").id = "copy-dialog-title";
-  panel.append(el("p", "card-meta", "Select the text below, then copy it from your device menu."));
+  panel.append(el("p", "card-meta", "Copy the subject into Gmail's subject line and the message into Gmail's body."));
+
+  const subjectLabel = el("label", "", "Subject");
+  subjectLabel.setAttribute("for", "copy-dialog-subject");
+  panel.append(subjectLabel);
+
+  const subjectInput = document.createElement("input");
+  subjectInput.id = "copy-dialog-subject";
+  subjectInput.readOnly = true;
+  subjectInput.autocomplete = "off";
+  subjectInput.spellcheck = false;
+  panel.append(subjectInput);
+
+  const bodyLabel = el("label", "", "Message");
+  bodyLabel.setAttribute("for", "copy-dialog-body");
+  panel.append(bodyLabel);
 
   const textarea = document.createElement("textarea");
+  textarea.id = "copy-dialog-body";
   textarea.readOnly = true;
   textarea.rows = 12;
   textarea.autocomplete = "off";
@@ -951,9 +992,17 @@ function getCopyDialog() {
   panel.append(textarea);
 
   const actions = el("div", "dialog-actions");
-  const selectButton = el("button", "copy-button", "Select text");
-  selectButton.type = "button";
-  selectButton.addEventListener("click", () => {
+  const subjectButton = el("button", "secondary-button", "Select subject");
+  subjectButton.type = "button";
+  subjectButton.addEventListener("click", () => {
+    subjectInput.focus();
+    subjectInput.select();
+    subjectInput.setSelectionRange(0, subjectInput.value.length);
+  });
+
+  const messageButton = el("button", "copy-button", "Select message");
+  messageButton.type = "button";
+  messageButton.addEventListener("click", () => {
     textarea.focus();
     textarea.select();
     textarea.setSelectionRange(0, textarea.value.length);
@@ -962,7 +1011,7 @@ function getCopyDialog() {
   const closeButton = el("button", "secondary-button", "Close");
   closeButton.type = "button";
   closeButton.addEventListener("click", () => dialog.classList.add("hidden"));
-  actions.append(selectButton, closeButton);
+  actions.append(subjectButton, messageButton, closeButton);
   panel.append(actions);
 
   dialog.addEventListener("click", (event) => {
@@ -974,6 +1023,16 @@ function getCopyDialog() {
   dialog.append(panel);
   document.body.append(dialog);
   return dialog;
+}
+
+function copySelectedControlText(control) {
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (error) {
+    copied = false;
+  }
+  return copied;
 }
 
 function showCopiedState(button, message) {
