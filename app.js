@@ -1,11 +1,16 @@
 "use strict";
 
-const MAX_RESULTS = 10;
+const DATA_INDEX_URL = "experts.json";
+const MAX_RESULTS = 12;
+const DEFAULT_SHARDS_TO_LOAD = 4;
+const MAX_SHARDS_TO_SEARCH = 8;
+
 const TERM_WEIGHTS = {
   field: 3.2,
   keyword: 7.5,
   paper: 2.1
 };
+
 const PHRASE_WEIGHTS = {
   field: 10,
   keyword: 18,
@@ -52,7 +57,14 @@ const SYNONYMS = new Map([
   ["iot", ["internet", "things", "sensor", "network"]],
   ["pv", ["photovoltaic", "solar", "energy"]],
   ["cfd", ["computational", "fluid", "dynamics"]],
-  ["fea", ["finite", "element", "analysis"]]
+  ["fea", ["finite", "element", "analysis"]],
+  ["gwas", ["genome", "wide", "association", "study"]],
+  ["qtl", ["quantitative", "trait", "locus"]],
+  ["dna", ["genetics", "genomics", "sequencing"]],
+  ["rna", ["transcriptomics", "gene", "expression"]],
+  ["pcr", ["polymerase", "chain", "reaction", "molecular", "biology"]],
+  ["rct", ["randomized", "controlled", "trial"]],
+  ["cbt", ["cognitive", "behavioral", "therapy"]]
 ]);
 
 const inputEl = document.querySelector("#student-input");
@@ -62,12 +74,21 @@ const findButtonEl = document.querySelector("#find-button");
 const resultsEl = document.querySelector("#results");
 const resultSummaryEl = document.querySelector("#result-summary");
 
-let experts = [];
-let searchIndex = null;
+let datasetMode = "loading";
+let manifest = null;
+let legacyDataset = null;
+let totalExpertCount = 0;
+let activeSearchId = 0;
+
+const shardCache = new Map();
 
 document.addEventListener("DOMContentLoaded", init);
 inputEl.addEventListener("input", updateWordCount);
-fieldFilterEl.addEventListener("change", runSearch);
+fieldFilterEl.addEventListener("change", () => {
+  if (inputEl.value.trim()) {
+    runSearch();
+  }
+});
 findButtonEl.addEventListener("click", runSearch);
 
 async function init() {
@@ -77,37 +98,286 @@ async function init() {
   renderEmptyState("Preparing mentor search...");
 
   try {
-    const response = await fetch("experts.json");
+    const response = await fetch(DATA_INDEX_URL);
 
     if (!response.ok) {
-      throw new Error(`Could not load experts.json (${response.status})`);
+      throw new Error(`Could not load mentor data (${response.status})`);
     }
 
-    experts = await response.json();
-    setSummary(`Indexing ${experts.length.toLocaleString()} mentor records...`);
+    const payload = await response.json();
+
+    if (isShardedManifest(payload)) {
+      datasetMode = "sharded";
+      manifest = normalizeManifest(payload);
+      totalExpertCount = manifest.totalExperts;
+      populateFieldFilterFromManifest(manifest);
+      findButtonEl.disabled = false;
+      setSummary(`Ready to search ${totalExpertCount.toLocaleString()} mentor records.`);
+      renderEmptyState("Enter a paragraph, then choose Find Mentors.");
+      return;
+    }
+
+    if (!Array.isArray(payload)) {
+      throw new Error("Mentor data is not in a recognized format.");
+    }
+
+    datasetMode = "single";
+    totalExpertCount = payload.length;
+    setSummary(`Indexing ${payload.length.toLocaleString()} mentor records...`);
     await waitForPaint();
-
-    searchIndex = buildSearchIndex(experts);
-    populateFieldFilter(experts);
-
+    legacyDataset = {
+      experts: payload,
+      index: await buildSearchIndex(payload)
+    };
+    populateFieldFilterFromExperts(payload);
     findButtonEl.disabled = false;
-    setSummary(`${experts.length.toLocaleString()} mentor records loaded.`);
+    setSummary(`${payload.length.toLocaleString()} mentor records loaded.`);
     renderEmptyState("Enter a paragraph, then choose Find Mentors.");
   } catch (error) {
     console.error(error);
+    datasetMode = "error";
     setSummary("Could not load mentor data.");
-    renderEmptyState("Start a local server with python -m http.server 8080, then reload this page.");
+    renderEmptyState("Start the local server, then reload this page.");
   }
 }
 
-function buildSearchIndex(expertList) {
+function isShardedManifest(payload) {
+  return Boolean(payload && typeof payload === "object" && Array.isArray(payload.shards));
+}
+
+function normalizeManifest(payload) {
+  const shards = payload.shards
+    .filter((shard) => shard && shard.file)
+    .map((shard, index) => ({
+      ...shard,
+      index,
+      count: Number(shard.count || 0),
+      fields: Array.isArray(shard.fields) ? shard.fields : [],
+      field_keys: Array.isArray(shard.field_keys) ? shard.field_keys : [],
+      keywords: Array.isArray(shard.keywords) ? shard.keywords : [],
+      token_hints: Array.isArray(shard.token_hints) ? shard.token_hints : [],
+      phrase_hints: Array.isArray(shard.phrase_hints) ? shard.phrase_hints : []
+    }));
+
+  return {
+    totalExperts: Number(payload.total_experts || payload.totalExperts || sum(shards.map((shard) => shard.count))),
+    fields: Array.isArray(payload.fields) ? payload.fields : [],
+    shards
+  };
+}
+
+async function runSearch() {
+  const studentText = inputEl.value.trim();
+  const searchId = activeSearchId + 1;
+  activeSearchId = searchId;
+
+  if (datasetMode === "loading") {
+    setSummary("Mentor index is still loading.");
+    return;
+  }
+
+  if (datasetMode === "error") {
+    setSummary("Mentor data is not available yet.");
+    return;
+  }
+
+  if (!studentText) {
+    setSummary("Enter a project paragraph first.");
+    renderEmptyState("Your paragraph can be rough. Specific methods, fields, technologies, and goals help most.");
+    return;
+  }
+
+  const query = buildQuery(studentText);
+
+  if (query.tokens.length === 0 && query.phrases.length === 0) {
+    setSummary("Try adding a few more specific research terms.");
+    renderEmptyState("Words like robotics, climate modeling, power electronics, plant genomics, or public health work well.");
+    return;
+  }
+
+  findButtonEl.disabled = true;
+  renderEmptyState("Scoring mentor matches...");
+
+  try {
+    const selectedField = fieldFilterEl.value;
+    const selectedFieldKey = selectedField === "all" ? "" : selectedField;
+    const searchResult = datasetMode === "sharded"
+      ? await scoreShardedQuery(query, selectedFieldKey, searchId)
+      : {
+          results: scoreQueryAgainstDataset(query, selectedFieldKey, legacyDataset),
+          searchedGroups: 1
+        };
+
+    if (searchId !== activeSearchId) {
+      return;
+    }
+
+    const results = searchResult.results;
+
+    if (results.length === 0) {
+      setSummary("No positive matches found.");
+      renderEmptyState("Try removing the field filter or adding more technical keywords from your project.");
+      return;
+    }
+
+    const groupText = searchResult.searchedGroups === 1 ? "mentor group" : "mentor groups";
+    setSummary(`Showing ${results.length} top matches from ${searchResult.searchedGroups} relevant ${groupText}.`);
+    renderResults(results, studentText);
+  } catch (error) {
+    console.error(error);
+    setSummary("Search could not complete.");
+    renderEmptyState("Refresh the page and try the search again.");
+  } finally {
+    if (searchId === activeSearchId) {
+      findButtonEl.disabled = false;
+    }
+  }
+}
+
+async function scoreShardedQuery(query, selectedFieldKey, searchId) {
+  const candidates = selectShardCandidates(query, selectedFieldKey);
+  const selectedShards = candidates.slice(0, MAX_SHARDS_TO_SEARCH);
+  const minimumShardCount = selectedFieldKey
+    ? Math.min(selectedShards.length, MAX_SHARDS_TO_SEARCH)
+    : Math.min(DEFAULT_SHARDS_TO_LOAD, selectedShards.length);
+  let combinedResults = [];
+  let searchedGroups = 0;
+
+  for (let index = 0; index < selectedShards.length; index += 1) {
+    const shouldContinue = index < minimumShardCount || combinedResults.length < MAX_RESULTS;
+    if (!shouldContinue) {
+      break;
+    }
+
+    if (searchId !== activeSearchId) {
+      return { results: [], searchedGroups };
+    }
+
+    const shard = selectedShards[index].shard;
+    setSummary(`Loading relevant mentor records (${index + 1}/${Math.min(selectedShards.length, MAX_SHARDS_TO_SEARCH)})...`);
+    const dataset = await loadShardDataset(shard);
+    searchedGroups += 1;
+
+    if (searchId !== activeSearchId) {
+      return { results: [], searchedGroups };
+    }
+
+    setSummary(`Scoring mentor matches (${searchedGroups} ${searchedGroups === 1 ? "group" : "groups"} searched)...`);
+    await waitForPaint();
+
+    const shardResults = scoreQueryAgainstDataset(query, selectedFieldKey, dataset);
+    combinedResults = mergeTopResults(combinedResults, shardResults);
+  }
+
+  return {
+    results: combinedResults.slice(0, MAX_RESULTS),
+    searchedGroups
+  };
+}
+
+function selectShardCandidates(query, selectedFieldKey) {
+  const scored = manifest.shards.map((shard) => ({
+    shard,
+    score: scoreShardForQuery(shard, query, selectedFieldKey)
+  }));
+  const fieldMatches = selectedFieldKey
+    ? scored.filter((item) => item.score > Number.NEGATIVE_INFINITY)
+    : scored;
+  const pool = fieldMatches.length > 0 ? fieldMatches : scored;
+
+  return pool.sort((a, b) => b.score - a.score || b.shard.count - a.shard.count || a.shard.index - b.shard.index);
+}
+
+function scoreShardForQuery(shard, query, selectedFieldKey) {
+  const profile = getShardProfile(shard);
+  let score = 0;
+
+  if (selectedFieldKey) {
+    if (!profile.fieldKeys.has(selectedFieldKey)) {
+      return Number.NEGATIVE_INFINITY;
+    }
+    score += 120;
+  }
+
+  query.tokens.forEach((token) => {
+    if (profile.fieldTokens.has(token)) {
+      score += 5;
+    }
+    if (profile.tokenHints.has(token)) {
+      score += 2;
+    }
+  });
+
+  query.phrases.forEach((phrase) => {
+    if (profile.phraseHints.has(phrase)) {
+      score += 12;
+    }
+  });
+
+  return score + Math.log1p(shard.count || 1) * 0.02;
+}
+
+function getShardProfile(shard) {
+  if (shard.profile) {
+    return shard.profile;
+  }
+
+  const fieldKeys = new Set(shard.field_keys.length > 0 ? shard.field_keys : shard.fields.map(toFieldKey));
+  const fieldTokens = new Set();
+  const tokenHints = new Set();
+  const phraseHints = new Set();
+
+  shard.fields.forEach((field) => {
+    const tokens = tokenize(field);
+    tokens.forEach((token) => fieldTokens.add(token));
+    buildPhraseList(tokens, 2, 5).forEach((phrase) => phraseHints.add(phrase));
+  });
+
+  [...shard.keywords, ...shard.token_hints].forEach((value) => {
+    tokenize(value).forEach((token) => tokenHints.add(token));
+  });
+
+  [...shard.keywords, ...shard.phrase_hints].forEach((value) => {
+    const tokens = tokenize(value);
+    if (tokens.length >= 2) {
+      phraseHints.add(tokens.join(" "));
+    }
+    buildPhraseList(tokens, 2, 5).forEach((phrase) => phraseHints.add(phrase));
+  });
+
+  shard.profile = { fieldKeys, fieldTokens, tokenHints, phraseHints };
+  return shard.profile;
+}
+
+async function loadShardDataset(shard) {
+  if (shardCache.has(shard.file)) {
+    return shardCache.get(shard.file);
+  }
+
+  const response = await fetch(shard.file);
+
+  if (!response.ok) {
+    throw new Error(`Could not load mentor group (${response.status})`);
+  }
+
+  const experts = await response.json();
+  const dataset = {
+    experts,
+    index: await buildSearchIndex(experts)
+  };
+  shardCache.set(shard.file, dataset);
+  return dataset;
+}
+
+async function buildSearchIndex(expertList) {
   const termIndex = new Map();
   const phraseIndex = new Map();
   const fieldNames = new Map();
   const docLengths = [];
   const fieldKeysByExpert = [];
 
-  expertList.forEach((expert, expertIndex) => {
+  for (let expertIndex = 0; expertIndex < expertList.length; expertIndex += 1) {
+    const expert = expertList[expertIndex];
     const termWeights = new Map();
     const phraseWeights = new Map();
     const fieldKeys = (expert.fields || []).map(toFieldKey);
@@ -133,7 +403,11 @@ function buildSearchIndex(expertList) {
       addPosting(phraseIndex, phrase, expertIndex, weight);
     });
     docLengths[expertIndex] = Math.max(1, docLength);
-  });
+
+    if (expertIndex > 0 && expertIndex % 1500 === 0) {
+      await waitForPaint();
+    }
+  }
 
   return {
     termIndex,
@@ -173,102 +447,62 @@ function addWeight(map, key, amount) {
   map.set(key, (map.get(key) || 0) + amount);
 }
 
-function runSearch() {
-  const studentText = inputEl.value.trim();
-
-  if (!searchIndex) {
-    setSummary("Mentor index is still loading.");
-    return;
-  }
-
-  if (!studentText) {
-    setSummary("Enter a project paragraph first.");
-    renderEmptyState("Your paragraph can be rough. Specific methods, fields, technologies, and goals help most.");
-    return;
-  }
-
-  const query = buildQuery(studentText);
-
-  if (query.tokens.length === 0 && query.phrases.length === 0) {
-    setSummary("Try adding a few more specific research terms.");
-    renderEmptyState("Words like robotics, climate modeling, power electronics, or public health work well.");
-    return;
-  }
-
-  findButtonEl.disabled = true;
-  setSummary("Scoring mentor matches...");
-
-  window.setTimeout(() => {
-    const selectedField = fieldFilterEl.value;
-    const results = scoreQuery(query, selectedField);
-
-    findButtonEl.disabled = false;
-
-    if (results.length === 0) {
-      setSummary("No positive matches found.");
-      renderEmptyState("Try removing the field filter or adding more technical keywords from your project.");
-      return;
-    }
-
-    setSummary(`Showing ${results.length} of ${experts.length.toLocaleString()} records by match score.`);
-    renderResults(results, studentText);
-  }, 0);
-}
-
-function scoreQuery(query, selectedField) {
+function scoreQueryAgainstDataset(query, selectedFieldKey, dataset) {
   const scores = new Map();
   const matchedTerms = new Map();
-  const selectedFieldKey = selectedField === "all" ? "" : selectedField;
+  const index = dataset.index;
 
   query.tokenCounts.forEach((count, token) => {
     addMatchesFromPostings({
-      postings: searchIndex.termIndex.get(token) || [],
+      postings: index.termIndex.get(token) || [],
       label: token,
       queryWeight: Math.min(count, 3),
       selectedFieldKey,
       scores,
       matchedTerms,
-      isPhrase: false
+      isPhrase: false,
+      index
     });
   });
 
   query.phrases.forEach((phrase) => {
     addMatchesFromPostings({
-      postings: searchIndex.phraseIndex.get(phrase) || [],
+      postings: index.phraseIndex.get(phrase) || [],
       label: phrase,
       queryWeight: 1.35,
       selectedFieldKey,
       scores,
       matchedTerms,
-      isPhrase: true
+      isPhrase: true,
+      index
     });
   });
 
   return [...scores.entries()]
     .map(([expertIndex, score]) => ({
-      expert: experts[expertIndex],
+      expert: dataset.experts[expertIndex],
       score: Math.round(score * 10) / 10,
       matchedTerms: topMatchedTerms(matchedTerms.get(expertIndex) || new Map())
     }))
     .filter((result) => result.score > 0)
-    .sort((a, b) => b.score - a.score || a.expert.name.localeCompare(b.expert.name))
+    .sort(compareResults)
     .slice(0, MAX_RESULTS);
 }
 
-function addMatchesFromPostings({ postings, label, queryWeight, selectedFieldKey, scores, matchedTerms, isPhrase }) {
+function addMatchesFromPostings({ postings, label, queryWeight, selectedFieldKey, scores, matchedTerms, isPhrase, index }) {
   if (postings.length === 0) {
     return;
   }
 
-  const idf = inverseDocumentFrequency(postings.length);
+  const idf = inverseDocumentFrequency(postings.length, index);
   const phraseBoost = isPhrase ? 1.4 : 1;
 
   postings.forEach(({ expertIndex, weight }) => {
-    if (selectedFieldKey && !searchIndex.fieldKeysByExpert[expertIndex].has(selectedFieldKey)) {
+    if (selectedFieldKey && !index.fieldKeysByExpert[expertIndex].has(selectedFieldKey)) {
       return;
     }
 
-    const bm25 = bm25Weight(weight, searchIndex.docLengths[expertIndex]);
+    const bm25 = bm25Weight(weight, index.docLengths[expertIndex], index);
     const contribution = idf * bm25 * queryWeight * phraseBoost;
     scores.set(expertIndex, (scores.get(expertIndex) || 0) + contribution);
 
@@ -280,16 +514,34 @@ function addMatchesFromPostings({ postings, label, queryWeight, selectedFieldKey
   });
 }
 
-function inverseDocumentFrequency(documentFrequency) {
-  const numerator = searchIndex.totalDocs - documentFrequency + 0.5;
+function mergeTopResults(existing, incoming) {
+  const bestById = new Map();
+
+  [...existing, ...incoming].forEach((result) => {
+    const key = result.expert.id || `${result.expert.name}::${result.expert.affiliation}`;
+    const previous = bestById.get(key);
+    if (!previous || compareResults(result, previous) < 0) {
+      bestById.set(key, result);
+    }
+  });
+
+  return [...bestById.values()].sort(compareResults).slice(0, MAX_RESULTS);
+}
+
+function compareResults(a, b) {
+  return b.score - a.score || a.expert.name.localeCompare(b.expert.name);
+}
+
+function inverseDocumentFrequency(documentFrequency, index) {
+  const numerator = index.totalDocs - documentFrequency + 0.5;
   const denominator = documentFrequency + 0.5;
   return Math.max(0.25, Math.log(1 + numerator / denominator));
 }
 
-function bm25Weight(weight, docLength) {
+function bm25Weight(weight, docLength, index) {
   const k1 = 1.4;
   const b = 0.72;
-  const lengthNorm = 1 - b + b * (docLength / searchIndex.averageDocLength);
+  const lengthNorm = 1 - b + b * (docLength / index.averageDocLength);
   return (weight * (k1 + 1)) / (weight + k1 * lengthNorm);
 }
 
@@ -304,10 +556,13 @@ function buildQuery(text) {
   const baseTokens = tokenize(text);
   const expandedTokens = expandTokens(baseTokens);
   const tokenCounts = countTokens(expandedTokens);
-  const phrases = buildPhraseList(expandedTokens, 2, 5);
+  const phrases = [...new Set([
+    ...buildPhraseList(baseTokens, 2, 5),
+    ...buildPhraseList(expandedTokens, 2, 5)
+  ])];
 
   return {
-    tokens: expandedTokens,
+    tokens: [...new Set(expandedTokens)],
     tokenCounts,
     phrases
   };
@@ -329,6 +584,12 @@ function expandTokens(tokens) {
   }
   if (joined.includes("artificial intelligence")) {
     expanded.push("ai", "machine", "learning");
+  }
+  if (joined.includes("plant breeding")) {
+    expanded.push("crop", "genomics", "phenotyping");
+  }
+  if (joined.includes("criminal justice")) {
+    expanded.push("criminology", "policing", "law");
   }
 
   return expanded.filter((token) => token.length > 1 && !STOPWORDS.has(token));
@@ -404,7 +665,27 @@ function countTokens(tokens) {
   return counts;
 }
 
-function populateFieldFilter(expertList) {
+function populateFieldFilterFromManifest(currentManifest) {
+  const fieldNames = new Map();
+
+  currentManifest.fields.forEach((field) => {
+    if (typeof field === "string") {
+      fieldNames.set(toFieldKey(field), field);
+    } else if (field && field.key && field.label) {
+      fieldNames.set(field.key, field.label);
+    }
+  });
+
+  currentManifest.shards.forEach((shard) => {
+    shard.fields.forEach((field) => {
+      fieldNames.set(toFieldKey(field), field);
+    });
+  });
+
+  populateFieldFilter(fieldNames);
+}
+
+function populateFieldFilterFromExperts(expertList) {
   const fieldNames = new Map();
 
   expertList.forEach((expert) => {
@@ -413,6 +694,10 @@ function populateFieldFilter(expertList) {
     });
   });
 
+  populateFieldFilter(fieldNames);
+}
+
+function populateFieldFilter(fieldNames) {
   fieldFilterEl.replaceChildren();
   const allOption = document.createElement("option");
   allOption.value = "all";
@@ -508,20 +793,24 @@ function createListSection(label, items, listClass) {
 
 async function copyOutreachDraft(button, expert, studentText) {
   const draft = buildOutreachDraft(expert, studentText);
+  const copied = await copyPlainText(draft);
 
-  try {
-    await navigator.clipboard.writeText(draft);
-    showCopiedState(button);
-  } catch (error) {
-    fallbackCopyText(draft);
-    showCopiedState(button);
+  if (copied) {
+    showCopiedState(button, "Copied");
+    return;
   }
+
+  showManualCopyDialog(draft);
+  showCopiedState(button, "Draft opened");
 }
 
 function buildOutreachDraft(expert, studentText) {
   const lastName = expert.name.split(" ").slice(-1)[0];
   const keywordList = (expert.keywords || []).slice(0, 3).join(", ");
-  const paper = (expert.papers || [])[0] || "your recent work";
+  const paper = (expert.papers || [])[0] || "";
+  const researchLine = keywordList
+    ? `Your work on ${keywordList} stood out to me${paper ? `, especially "${paper}."` : "."}`
+    : `Your research profile stood out to me${paper ? `, especially "${paper}."` : "."}`;
 
   return `Subject: Student interested in your research
 
@@ -531,10 +820,33 @@ My name is [Your Name], and I am exploring potential mentors for a student resea
 
 "${studentText}"
 
-Your work on ${keywordList} stood out to me, especially "${paper}." If you are open to it, I would be grateful for a short conversation or any advice about whether my interests connect with your research.
+${researchLine} If you are open to it, I would be grateful for a short conversation or any advice about whether my interests connect with your research.
 
 Thank you for your time,
 [Your Name]`;
+}
+
+async function copyPlainText(text) {
+  if (navigator.clipboard && window.ClipboardItem && navigator.clipboard.write) {
+    try {
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      await navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]);
+      return true;
+    } catch (error) {
+      console.debug("Plain clipboard write failed; trying writeText.", error);
+    }
+  }
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (error) {
+      console.debug("Clipboard writeText failed; trying legacy copy.", error);
+    }
+  }
+
+  return fallbackCopyText(text);
 }
 
 function fallbackCopyText(text) {
@@ -542,16 +854,91 @@ function fallbackCopyText(text) {
   hiddenTextarea.value = text;
   hiddenTextarea.setAttribute("readonly", "");
   hiddenTextarea.style.position = "fixed";
-  hiddenTextarea.style.left = "-9999px";
+  hiddenTextarea.style.top = "0";
+  hiddenTextarea.style.left = "0";
+  hiddenTextarea.style.width = "1px";
+  hiddenTextarea.style.height = "1px";
+  hiddenTextarea.style.opacity = "0";
   document.body.append(hiddenTextarea);
+  hiddenTextarea.focus();
   hiddenTextarea.select();
-  document.execCommand("copy");
+  hiddenTextarea.setSelectionRange(0, hiddenTextarea.value.length);
+
+  let copied = false;
+  try {
+    copied = document.execCommand("copy");
+  } catch (error) {
+    copied = false;
+  }
+
   hiddenTextarea.remove();
+  return copied;
 }
 
-function showCopiedState(button) {
+function showManualCopyDialog(text) {
+  const dialog = getCopyDialog();
+  const textarea = dialog.querySelector("textarea");
+  textarea.value = text;
+  dialog.classList.remove("hidden");
+  textarea.focus();
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+}
+
+function getCopyDialog() {
+  let dialog = document.querySelector("#copy-dialog");
+  if (dialog) {
+    return dialog;
+  }
+
+  dialog = el("div", "copy-dialog hidden");
+  dialog.id = "copy-dialog";
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-labelledby", "copy-dialog-title");
+
+  const panel = el("div", "copy-dialog-panel");
+  panel.append(el("h2", "", "Copy email draft"));
+  panel.querySelector("h2").id = "copy-dialog-title";
+  panel.append(el("p", "card-meta", "Select the text below, then copy it from your device menu."));
+
+  const textarea = document.createElement("textarea");
+  textarea.readOnly = true;
+  textarea.rows = 12;
+  textarea.autocomplete = "off";
+  textarea.autocapitalize = "sentences";
+  textarea.spellcheck = false;
+  panel.append(textarea);
+
+  const actions = el("div", "dialog-actions");
+  const selectButton = el("button", "copy-button", "Select text");
+  selectButton.type = "button";
+  selectButton.addEventListener("click", () => {
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+  });
+
+  const closeButton = el("button", "secondary-button", "Close");
+  closeButton.type = "button";
+  closeButton.addEventListener("click", () => dialog.classList.add("hidden"));
+  actions.append(selectButton, closeButton);
+  panel.append(actions);
+
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog) {
+      dialog.classList.add("hidden");
+    }
+  });
+
+  dialog.append(panel);
+  document.body.append(dialog);
+  return dialog;
+}
+
+function showCopiedState(button, message) {
   const originalText = button.textContent;
-  button.textContent = "Copied";
+  button.textContent = message;
   button.classList.add("copied");
 
   window.setTimeout(() => {
@@ -580,7 +967,11 @@ function average(values) {
   if (values.length === 0) {
     return 1;
   }
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
+  return sum(values) / values.length;
+}
+
+function sum(values) {
+  return values.reduce((total, value) => total + value, 0);
 }
 
 function waitForPaint() {
