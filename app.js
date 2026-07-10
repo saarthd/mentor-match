@@ -2,7 +2,7 @@
 
 const DATA_INDEX_URL = "experts.json";
 const MAX_RESULTS = 12;
-const DEFAULT_SHARDS_TO_LOAD = 4;
+const DEFAULT_SHARDS_TO_LOAD = 3;
 const MAX_SHARDS_TO_SEARCH = 8;
 
 const TERM_WEIGHTS = {
@@ -205,7 +205,8 @@ async function runSearch() {
       ? await scoreShardedQuery(query, selectedFieldKey, searchId)
       : {
           results: scoreQueryAgainstDataset(query, selectedFieldKey, legacyDataset),
-          searchedGroups: 1
+          scannedExperts: legacyDataset.experts.length,
+          failedGroups: 0
         };
 
     if (searchId !== activeSearchId) {
@@ -220,8 +221,7 @@ async function runSearch() {
       return;
     }
 
-    const groupText = searchResult.searchedGroups === 1 ? "mentor group" : "mentor groups";
-    setSummary(`Showing ${results.length} top matches from ${searchResult.searchedGroups} relevant ${groupText}.`);
+    setSummary(formatSearchSummary(results.length, searchResult));
     renderResults(results, studentText);
   } catch (error) {
     console.error(error);
@@ -242,6 +242,8 @@ async function scoreShardedQuery(query, selectedFieldKey, searchId) {
     : Math.min(DEFAULT_SHARDS_TO_LOAD, selectedShards.length);
   let combinedResults = [];
   let searchedGroups = 0;
+  let scannedExperts = 0;
+  let failedGroups = 0;
 
   for (let index = 0; index < selectedShards.length; index += 1) {
     const shouldContinue = index < minimumShardCount || combinedResults.length < MAX_RESULTS;
@@ -250,29 +252,56 @@ async function scoreShardedQuery(query, selectedFieldKey, searchId) {
     }
 
     if (searchId !== activeSearchId) {
-      return { results: [], searchedGroups };
+      return { results: [], searchedGroups, scannedExperts, failedGroups };
     }
 
     const shard = selectedShards[index].shard;
-    setSummary(`Loading relevant mentor records (${index + 1}/${Math.min(selectedShards.length, MAX_SHARDS_TO_SEARCH)})...`);
-    const dataset = await loadShardDataset(shard);
-    searchedGroups += 1;
+    setSummary(`Loading relevant mentor records... ${scannedExperts.toLocaleString()} of ${totalExpertCount.toLocaleString()} experts scanned.`);
 
-    if (searchId !== activeSearchId) {
-      return { results: [], searchedGroups };
+    let dataset = null;
+    try {
+      dataset = await loadShardDataset(shard);
+    } catch (error) {
+      failedGroups += 1;
+      console.warn("Skipping a mentor data group that could not load.", error);
+      continue;
     }
 
-    setSummary(`Scoring mentor matches (${searchedGroups} ${searchedGroups === 1 ? "group" : "groups"} searched)...`);
+    searchedGroups += 1;
+    scannedExperts += dataset.experts.length;
+
+    if (searchId !== activeSearchId) {
+      return { results: [], searchedGroups, scannedExperts, failedGroups };
+    }
+
+    setSummary(`Scoring mentor matches... ${scannedExperts.toLocaleString()} of ${totalExpertCount.toLocaleString()} experts scanned.`);
     await waitForPaint();
 
-    const shardResults = scoreQueryAgainstDataset(query, selectedFieldKey, dataset);
-    combinedResults = mergeTopResults(combinedResults, shardResults);
+    try {
+      const shardResults = scoreQueryAgainstDataset(query, selectedFieldKey, dataset);
+      combinedResults = mergeTopResults(combinedResults, shardResults);
+    } catch (error) {
+      failedGroups += 1;
+      console.warn("Skipping a mentor data group that could not be scored.", error);
+    }
   }
 
   return {
     results: combinedResults.slice(0, MAX_RESULTS),
-    searchedGroups
+    searchedGroups,
+    scannedExperts,
+    failedGroups
   };
+}
+
+function formatSearchSummary(resultCount, searchResult) {
+  const scannedExperts = Number(searchResult.scannedExperts || 0);
+  const totalExperts = Math.max(Number(totalExpertCount || 0), scannedExperts);
+  const skippedText = searchResult.failedGroups
+    ? " Some records were skipped because they could not be loaded."
+    : "";
+
+  return `Showing ${resultCount} top matches after scanning ${scannedExperts.toLocaleString()} of ${totalExperts.toLocaleString()} experts.${skippedText}`;
 }
 
 function selectShardCandidates(query, selectedFieldKey) {
@@ -792,7 +821,7 @@ function createListSection(label, items, listClass) {
 }
 
 async function copyOutreachDraft(button, expert, studentText) {
-  const draft = buildOutreachDraft(expert, studentText);
+  const draft = normalizeClipboardText(buildOutreachDraft(expert, studentText));
   const copied = await copyPlainText(draft);
 
   if (copied) {
@@ -827,26 +856,22 @@ Thank you for your time,
 }
 
 async function copyPlainText(text) {
-  if (navigator.clipboard && window.ClipboardItem && navigator.clipboard.write) {
-    try {
-      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-      await navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]);
-      return true;
-    } catch (error) {
-      console.debug("Plain clipboard write failed; trying writeText.", error);
-    }
-  }
+  const plainText = normalizeClipboardText(text);
 
   if (navigator.clipboard && navigator.clipboard.writeText) {
     try {
-      await navigator.clipboard.writeText(text);
+      await navigator.clipboard.writeText(plainText);
       return true;
     } catch (error) {
       console.debug("Clipboard writeText failed; trying legacy copy.", error);
     }
   }
 
-  return fallbackCopyText(text);
+  if (isIOSDevice()) {
+    return false;
+  }
+
+  return fallbackCopyText(plainText);
 }
 
 function fallbackCopyText(text) {
@@ -873,6 +898,21 @@ function fallbackCopyText(text) {
 
   hiddenTextarea.remove();
   return copied;
+}
+
+function normalizeClipboardText(text) {
+  return String(text)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\u00a0/g, " ");
+}
+
+function isIOSDevice() {
+  const platform = navigator.platform || "";
+  const userAgent = navigator.userAgent || "";
+  const maxTouchPoints = navigator.maxTouchPoints || 0;
+  return /iPad|iPhone|iPod/.test(userAgent)
+    || (platform === "MacIntel" && maxTouchPoints > 1);
 }
 
 function showManualCopyDialog(text) {
